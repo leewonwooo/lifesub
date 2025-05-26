@@ -60,3 +60,5 @@ public class MemberEntity extends BaseTimeEntity {
         this.userName = userName;
     }
 }
+
+
