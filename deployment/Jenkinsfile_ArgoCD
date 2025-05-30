@@ -1,0 +1,196 @@
+def PIPELINE_ID = "${env.BUILD_NUMBER}"
+
+def getImageTag() {
+    def dateFormat = new java.text.SimpleDateFormat('yyyyMMddHHmmss')
+    def currentDate = new Date()
+    return dateFormat.format(currentDate)
+}
+
+podTemplate(
+    label: "${PIPELINE_ID}",
+    serviceAccount: 'jenkins',
+    containers: [
+        containerTemplate(name: 'podman', image: "mgoltzsche/podman", ttyEnabled: true, command: 'cat', privileged: true),
+        containerTemplate(name: 'gradle',
+                        image: 'gradle:jdk17',
+                        ttyEnabled: true,
+                        command: 'cat',
+                        envVars: [
+                            envVar(key: 'DOCKER_HOST', value: 'unix:///run/podman/podman.sock'),
+                            envVar(key: 'TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE', value: '/run/podman/podman.sock'),
+                            envVar(key: 'TESTCONTAINERS_RYUK_DISABLED', value: 'true')
+                        ]),
+        containerTemplate(name: 'git', image: 'alpine/git:latest', command: 'cat', ttyEnabled: true)
+    ],
+    volumes: [
+        emptyDirVolume(mountPath: '/home/gradle/.gradle', memory: false),
+        emptyDirVolume(mountPath: '/run/podman', memory: false)
+    ]
+) {
+    node(PIPELINE_ID) {
+        def props
+        def imageTag = getImageTag()
+        def services = ['member', 'mysub', 'recommend']
+        def manifestRepo = 'https://github.com/leewonwooo/lifesub-manifest.git'
+
+        stage("Get Source") {
+            checkout scm
+            props = readProperties file: "deployment/deploy_env_vars"
+        }
+
+        stage('Build Applications & SonarQube Analysis') {
+            container('podman') {
+                sh 'podman system service -t 0 unix:///run/podman/podman.sock & sleep 2'
+            }
+
+            container('gradle') {
+                def testContainersConfig = '''docker.client.strategy=org.testcontainers.dockerclient.UnixSocketClientProviderStrategy
+docker.host=unix:///run/podman/podman.sock
+ryuk.container.privileged=true
+testcontainers.reuse.enable=true'''
+
+                sh """
+                    # TestContainers 설정
+                    mkdir -p member/src/test/resources mysub-infra/src/test/resources recommend/src/test/resources
+                    echo '${testContainersConfig}' > member/src/test/resources/testcontainers.properties
+                    echo '${testContainersConfig}' > mysub-infra/src/test/resources/testcontainers.properties
+                    echo '${testContainersConfig}' > recommend/src/test/resources/testcontainers.properties
+                """
+
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        chmod +x gradlew
+
+                        # 빌드 실행
+                        ./gradlew :member:build :mysub-infra:build :recommend:build -x test
+
+                        # Member 서비스
+                        ./gradlew :member:test :member:jacocoTestReport :member:sonar \
+                            -Dsonar.projectKey=lifesub-member-dg0401 \
+                            -Dsonar.projectName=lifesub-member-dg0401 \
+                            -Dsonar.java.binaries=build/classes/java/main \
+                            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                            -Dsonar.exclusions=**/config/**,**/entity/**,**/dto/**,**/*Application.class,**/exception/**
+
+                        # Recommend 서비스
+                        ./gradlew :recommend:test :recommend:jacocoTestReport :recommend:sonar \
+                            -Dsonar.projectKey=lifesub-recommend-dg0401 \
+                            -Dsonar.projectName=lifesub-recommend-dg0401 \
+                            -Dsonar.java.binaries=build/classes/java/main \
+                            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                            -Dsonar.exclusions=**/config/**,**/entity/**,**/dto/**,**/*Application.class,**/exception/**
+
+                        # Mysub 서비스 (biz & infra 구조)
+                        ./gradlew :mysub-infra:test :mysub-infra:jacocoTestReport :mysub-infra:sonar \
+                            -Dsonar.projectKey=lifesub-mysub-dg0401 \
+                            -Dsonar.projectName=lifesub-mysub-dg0401 \
+                            -Dsonar.java.binaries=build/classes/java/main \
+                            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                            -Dsonar.exclusions=**/config/**,**/entity/**,**/dto/**,**/*Application.class,**/exception/**
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            timeout(time: 10, unit: 'MINUTES') {
+                def qg = waitForQualityGate()
+                if (qg.status != 'OK') {
+                    error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                }
+            }
+        }
+
+        stage('Build & Push Images') {
+            container('podman') {
+                withCredentials([usernamePassword(
+                    credentialsId: 'acr-credentials',
+                    usernameVariable: 'USERNAME',
+                    passwordVariable: 'PASSWORD'
+                )]) {
+                    sh "podman login ${props.registry} --username \$USERNAME --password \$PASSWORD"
+
+                    services.each { service ->
+                        def buildDir = service == 'mysub' ? 'mysub-infra' : service
+                        def jarFile = service == 'mysub' ? 'mysub.jar' : "${service}.jar"
+
+                        sh """
+                            echo "Building ${service} service..."
+                            podman build \
+                                --build-arg BUILD_LIB_DIR="${buildDir}/build/libs" \
+                                --build-arg ARTIFACTORY_FILE="${jarFile}" \
+                                -f deployment/container/Dockerfile \
+                                -t ${props.registry}/${props.image_org}/${service}:${imageTag} .
+
+                            echo "Pushing ${service} image..."
+                            podman push ${props.registry}/${props.image_org}/${service}:${imageTag}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Update Manifest Repository') {
+            container('git') {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-credentials-dg0401',
+                    usernameVariable: 'GIT_USERNAME',
+                    passwordVariable: 'GIT_PASSWORD'
+                )]) {
+                    sh """
+                        # Git 전역 설정
+                        git config --global user.name "Jenkins CI"
+                        git config --global user.email "jenkins@lifesub.com"
+                        
+                        # Manifest repository 클론
+                        git clone https://\${GIT_USERNAME}:\${GIT_PASSWORD}@github.com/leewonwooo/lifesub-manifest.git
+                        cd lifesub-manifest
+                        
+                        echo "=========================================="
+                        echo "🔄 Updating Backend Service Images"
+                        echo "Image Tag: ${imageTag}"
+                        echo "=========================================="
+                    """
+
+                    // 각 서비스별 deployment 파일 업데이트
+                    services.each { service ->
+                        sh """
+                            cd lifesub-manifest
+                            
+                            echo "Updating ${service} deployment..."
+                            
+                            # 해당 서비스의 deployment 파일에서 이미지 태그 업데이트
+                            if [ -f "lifesub/${service}/${service}-deployment.yaml" ]; then
+                                sed -i 's|image: ${props.registry}/${props.image_org}/${service}:.*|image: ${props.registry}/${props.image_org}/${service}:${imageTag}|g' lifesub/${service}/${service}-deployment.yaml
+                                
+                                # 변경사항 확인
+                                echo "=== ${service}-deployment.yaml 변경사항 ==="
+                                git diff lifesub/${service}/${service}-deployment.yaml || true
+                                
+                                # 변경사항 커밋
+                                git add lifesub/${service}/${service}-deployment.yaml
+                                git commit -m "Update ${service} image to ${imageTag}" || echo "No changes for ${service}"
+                            else
+                                echo "Warning: lifesub/${service}/${service}-deployment.yaml not found"
+                            fi
+                        """
+                    }
+
+                    sh """
+                        cd lifesub-manifest
+                        
+                        # 모든 변경사항 푸시
+                        git push origin main
+                        
+                        echo "=========================================="
+                        echo "✅ Manifest Repository Updated Successfully!"
+                        echo "Backend Services: ${services.join(', ')}"
+                        echo "Image Tag: ${imageTag}"
+                        echo "ArgoCD will detect changes and deploy automatically"
+                        echo "=========================================="
+                    """
+                }
+            }
+        }
+    }
+}
